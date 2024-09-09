@@ -31,59 +31,106 @@ async function connectToMongo() {
 
 connectToMongo();
 
-// Function to set up WebSocket handlers once connected to the database
 function setupWebSocketHandlers() {
-  // Handle WebSocket connections
   wss.on('connection', (ws) => {
-    ws.on('message', (message) => {
-      const data = JSON.parse(message);
+    ws.on('message', async (message) => {
+      try {
+        const data = JSON.parse(message);
 
-      // On ESP32 boot: get pill schedule
-      if (data.type === 'get_schedule') {
-        const patientId = data.patient_id;
-        db.collection('schedules').findOne({ patient_id: patientId }, (err, schedule) => {
-          if (err) throw err;
-          // Send pill schedule back to ESP32
-          ws.send(JSON.stringify({ type: 'schedule', schedule: schedule.schedule }));
-        });
-      }
+        if (!data.type) {
+          console.error('Invalid message type');
+          return;
+        }
 
-      // Log pill taken or missed
-      if (data.type === 'log_event') {
-        const logEntry = {
-          patient_id: data.patient_id,
-          time_taken: data.time_taken,
-          status: data.status,
-        };
-        db.collection('logs').insertOne(logEntry, (err, result) => {
-          if (err) throw err;
-          // Notify frontend that new data has been logged
-          broadcastNewLog(logEntry);
-        });
-      }
-
-      // Update pill schedule from frontend
-      if (data.type === 'update_schedule') {
-        const patientId = data.patient_id;
-        const newSchedule = data.schedule;
-
-        // Update schedule in the database
-        db.collection('schedules').updateOne(
-          { patient_id: patientId },
-          { $set: { schedule: newSchedule } },
-          (err, result) => {
-            if (err) throw err;
-
-            // Notify ESP32 about updated schedule
-            broadcastNewSchedule(patientId, newSchedule);
-          }
-        );
+        switch (data.type) {
+          case 'get_schedule':
+            await handleGetSchedule(ws, data);
+            break;
+          
+          case 'log_event':
+            await handleLogEvent(data);
+            break;
+          
+          case 'update_schedule':
+            await handleUpdateSchedule(data);
+            break;
+          
+          default:
+            console.error('Unknown message type:', data.type);
+        }
+      } catch (err) {
+        console.error('Error processing message:', err);
       }
     });
   });
 }
 
-// Function to broadcast log data to all connected clients
+async function handleGetSchedule(ws, data) {
+  const patientId = data.patient_id;
+  if (!patientId) {
+    console.error('Missing patient_id in get_schedule message');
+    return;
+  }
+
+  try {
+    const schedule = await db.collection('schedules').findOne({ patient_id: patientId });
+    if (!schedule) {
+      console.log('No schedule found for patient_id:', patientId);
+      ws.send(JSON.stringify({ type: 'schedule', schedule: null }));
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'schedule', schedule: schedule.schedule }));
+  } catch (err) {
+    console.error('Error fetching schedule:', err);
+  }
+}
+
+async function handleLogEvent(data) {
+  const logEntry = {
+    patient_id: data.patient_id,
+    time_taken: data.time_taken,
+    status: data.status,
+  };
+
+  try {
+    const result = await db.collection('logs').insertOne(logEntry);
+    console.log('Log entry inserted:', result.insertedId);
+    broadcastNewLog(logEntry);
+  } catch (err) {
+    console.error('Error inserting log entry:', err);
+  }
+}
+
+async function handleUpdateSchedule(data) {
+  const patientId = data.patient_id;
+  const newSchedule = data.schedule;
+
+  // if (!patientId || !Array.isArray(newSchedule)) {
+  //   console.error('Invalid data for update_schedule message');
+  //   return;
+  // }
+
+  try {
+    const result = await db.collection('schedules').updateOne(
+      { patient_id: patientId },
+      { $set: { schedule: newSchedule } },
+      { upsert: true }
+    );
+    
+    if (result.matchedCount === 0) {
+      console.log('No document matched the query; a new document was created for patient_id:', patientId);
+    } else if (result.modifiedCount === 0) {
+      console.log('Document matched but not modified for patient_id:', patientId);
+    } else {
+      console.log('Schedule updated for patient_id:', patientId);
+    }
+
+    broadcastNewSchedule(patientId, newSchedule);
+  } catch (err) {
+    console.error('Error updating schedule:', err);
+  }
+}
+
 function broadcastNewLog(logEntry) {
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
@@ -92,7 +139,6 @@ function broadcastNewLog(logEntry) {
   });
 }
 
-// Function to broadcast updated schedule to ESP32
 function broadcastNewSchedule(patientId, newSchedule) {
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
